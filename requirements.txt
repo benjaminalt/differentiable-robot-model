@@ -4,5 +4,3 @@ pyquaternion
 hydra-core
 urdf_parser_py
 jupyter
-tqdm
-matplotlib

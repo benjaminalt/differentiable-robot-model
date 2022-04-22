@@ -5,15 +5,12 @@ Utils
 TODO
 """
 
-import random
-from contextlib import contextmanager
-
-import numpy as np
-import timeit
-import torch
 import operator
 from functools import reduce
 
+import numpy as np
+import torch
+from .external.pytorch3d_transformations import matrix_to_euler_angles, quaternion_to_matrix
 
 prod = lambda l: reduce(operator.mul, l, 1)
 
@@ -61,10 +58,7 @@ def exp_map_so3(omega, epsilon=1.0e-14):
     exp_omegahat = (
         torch.eye(3)
         + ((torch.sin(norm_omega) / (norm_omega + epsilon)) * omegahat)
-        + (
-            ((1.0 - torch.cos(norm_omega)) / (torch_square(norm_omega + epsilon)))
-            * (omegahat @ omegahat)
-        )
+        + (((1.0 - torch.cos(norm_omega)) / (torch_square(norm_omega + epsilon))) * (omegahat @ omegahat))
     )
     return exp_omegahat
 
@@ -84,3 +78,39 @@ def convert_into_at_least_2d_pytorch_tensor(variable):
         return tensor_var.unsqueeze(0)
     else:
         return tensor_var
+
+
+def sqrt_positive_part(x: torch.Tensor) -> torch.Tensor:
+    """
+    Returns torch.sqrt(torch.max(0, x))
+    but with a zero subgradient where x is 0.
+    """
+    ret = torch.zeros_like(x)
+    positive_mask = x > 0
+    ret[positive_mask] = torch.sqrt(x[positive_mask])
+    return ret
+
+
+def quaternion_to_rotation_matrix(quaternions: torch.Tensor) -> torch.Tensor:
+    return quaternion_to_matrix(quaternions)
+
+
+def pose_to_affine(pose: torch.Tensor) -> torch.Tensor:
+    assert pose.shape[-1] == 7
+    rot = quaternion_to_rotation_matrix(pose[..., 3:])
+    trans = pose[..., :3].unsqueeze(-1)
+    # torch.eye doesn't work as it does not retain grads
+    affine = torch.as_tensor([0, 0, 0, 1], dtype=pose.dtype, device=pose.device).repeat((*pose.shape[:-1], 1, 1))
+    affine = torch.concat((torch.concat((rot, trans), dim=-1), affine), dim=-2)
+    return affine
+
+
+def quaternion_to_euler_zyx(q: torch.Tensor) -> torch.Tensor:
+    """
+    Convert q quaternion (w,x,y,z) to Euler angles (ZYX convention, in radians, normalized to [-pi, pi])
+    https://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles#Quaternion_to_Euler_Angles_Conversion
+    :param q: Quaternion (w,x,y,z)
+    :return Euler angles (ZYX convention, in radians, normalized to [-pi, pi])
+    """
+    rotations = matrix_to_euler_angles(quaternion_to_matrix(q), convention="ZYX").flip(-1)
+    return rotations
