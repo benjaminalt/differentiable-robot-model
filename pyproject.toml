@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "differentiable-robot-model"
+description = "Differentiable Robot Model"
+license = "MIT"
+version = "1.0"
+dependencies = [
+    'numpy==1.26.4',
+    'torch==2.2.2',
+    'urdf_parser_py==0.0.4',
+]
+
+[tool.black]
+line-length = 120
+
+[tool.isort]
+profile = "black"
+line_length = 120

@@ -5,8 +5,8 @@ Data generation utils
 TODO
 """
 
-import torch
 import numpy as np
+import torch
 from torch.utils.data.dataset import Dataset
 
 
@@ -54,9 +54,7 @@ def generate_random_forward_kinematics_data(robot_model, n_data, ee_name):
     joint_lower_bounds = np.asarray([joint["lower"] for joint in limits_per_joint])
     joint_upper_bounds = np.asarray([joint["upper"] for joint in limits_per_joint])
     q = torch.tensor(
-        np.random.uniform(
-            low=joint_lower_bounds, high=joint_upper_bounds, size=(n_data, ndof)
-        ),
+        np.random.uniform(low=joint_lower_bounds, high=joint_upper_bounds, size=(n_data, ndof)),
         dtype=torch.float32,
         device=device,
     )
@@ -73,19 +71,13 @@ def generate_random_inverse_dynamics_data(robot_model, n_data):
     limits_per_joint = robot_model.get_joint_limits()
     joint_lower_bounds = np.asarray([joint["lower"] for joint in limits_per_joint])
     joint_upper_bounds = np.asarray([joint["upper"] for joint in limits_per_joint])
-    joint_velocity_limits = 0.2 * np.asarray(
-        [joint["velocity"] for joint in limits_per_joint]
-    )
+    joint_velocity_limits = 0.2 * np.asarray([joint["velocity"] for joint in limits_per_joint])
     q = torch.tensor(
-        np.random.uniform(
-            low=joint_lower_bounds, high=joint_upper_bounds, size=(n_data, 7)
-        ),
+        np.random.uniform(low=joint_lower_bounds, high=joint_upper_bounds, size=(n_data, 7)),
         dtype=torch.float32,
     )
     qd = torch.tensor(
-        np.random.uniform(
-            low=-joint_velocity_limits, high=joint_velocity_limits, size=(n_data, 7)
-        ),
+        np.random.uniform(low=-joint_velocity_limits, high=joint_velocity_limits, size=(n_data, 7)),
         dtype=torch.float32,
     )
     qdd_des = torch.tensor(
@@ -100,13 +92,9 @@ def generate_random_inverse_dynamics_data(robot_model, n_data):
     q = q.to(device)
     qd = qd.to(device)
     qdd_des = qdd_des.to(device)
-    torques = robot_model.compute_inverse_dynamics(
-        q=q, qd=qd, qdd_des=qdd_des, include_gravity=True
-    )
+    torques = robot_model.compute_inverse_dynamics(q=q, qd=qd, qdd_des=qdd_des, include_gravity=True)
 
-    return InverseDynamicsDataset(
-        data={"q": q, "qd": qd, "qdd_des": qdd_des, "tau": torques}
-    )
+    return InverseDynamicsDataset(data={"q": q, "qd": qd, "qdd_des": qdd_des, "tau": torques})
 
 
 def generate_sine_motion_inverse_dynamics_data(robot_model, n_data, dt, freq):
@@ -120,29 +108,15 @@ def generate_sine_motion_inverse_dynamics_data(robot_model, n_data, dt, freq):
     pi = torch.acos(torch.zeros(1)).item() * 2
 
     q = A * torch.sin(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs) + q_start
-    qd = (
-        2
-        * pi
-        * freq
-        * A
-        * torch.cos(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs)
-    )
-    qdd_des = (
-        -((2 * pi * freq) ** 2)
-        * A
-        * torch.sin(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs)
-    )
+    qd = 2 * pi * freq * A * torch.cos(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs)
+    qdd_des = -((2 * pi * freq) ** 2) * A * torch.sin(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs)
 
     q = q.to(device)
     qd = qd.to(device)
     qdd_des = qdd_des.to(device)
-    torques = robot_model.compute_inverse_dynamics(
-        q=q, qd=qd, qdd_des=qdd_des, include_gravity=True
-    )
+    torques = robot_model.compute_inverse_dynamics(q=q, qd=qd, qdd_des=qdd_des, include_gravity=True)
 
-    return InverseDynamicsDataset(
-        data={"q": q, "qd": qd, "qdd_des": qdd_des, "tau": torques}
-    )
+    return InverseDynamicsDataset(data={"q": q, "qd": qd, "qdd_des": qdd_des, "tau": torques})
 
 
 def generate_sine_motion_forward_dynamics_data(robot_model, n_data, dt, freq):
@@ -156,26 +130,12 @@ def generate_sine_motion_forward_dynamics_data(robot_model, n_data, dt, freq):
     pi = torch.acos(torch.zeros(1)).item() * 2
 
     q = A * torch.sin(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs) + q_start
-    qd = (
-        2
-        * pi
-        * freq
-        * A
-        * torch.cos(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs)
-    )
-    qdd_des = (
-        -((2 * pi * freq) ** 2)
-        * A
-        * torch.sin(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs)
-    )
+    qd = 2 * pi * freq * A * torch.cos(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs)
+    qdd_des = -((2 * pi * freq) ** 2) * A * torch.sin(2 * pi * freq * t).reshape(n_data, 1).repeat(1, n_dofs)
 
     q = q.to(device)
     qd = qd.to(device)
     qdd_des = qdd_des.to(device)
-    torques = robot_model.compute_inverse_dynamics(
-        q=q, qd=qd, qdd_des=qdd_des, include_gravity=True
-    )
+    torques = robot_model.compute_inverse_dynamics(q=q, qd=qd, qdd_des=qdd_des, include_gravity=True)
 
-    return ForwardDynamicsDataset(
-        data={"q": q, "qd": qd, "qdd_des": qdd_des, "tau": torques}
-    )
+    return ForwardDynamicsDataset(data={"q": q, "qd": qd, "qdd_des": qdd_des, "tau": torques})

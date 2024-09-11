@@ -8,7 +8,6 @@ SE3 SO3 utilities
 
 import torch
 
-
 assert_epsilon = 1.0e-3
 
 
@@ -39,9 +38,7 @@ def convertAxisAngleToQuaternion(axis_angle, epsilon=1.0e-5):
         quat[:3] = axis * torch.sin(angle / 2.0)
         quat[3] = torch.cos(angle / 2.0)
     else:
-        quat = torch.tensor(
-            [0.0, 0.0, 0.0, 1.0], device=axis_angle.device, dtype=axis_angle.dtype
-        )
+        quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=axis_angle.device, dtype=axis_angle.dtype)
     quat = quat / torch.norm(quat)
     return quat
 
@@ -71,9 +68,7 @@ def getSkewSymMatFromVec3(omega):
 
 
 def getVec3FromSkewSymMat(omegahat, epsilon=1.0e-14):
-    assert torch.norm(torch.diag(omegahat)) < assert_epsilon, (
-        "omegahat = \n%s" % omegahat
-    )
+    assert torch.norm(torch.diag(omegahat)) < assert_epsilon, "omegahat = \n%s" % omegahat
     for i in range(3):
         for j in range(i + 1, 3):
             v1 = omegahat[i, j]
@@ -133,9 +128,7 @@ def getInverseHomogeneousTransformMatrix(T, epsilon=1.0e-14):
     assert torch.norm(T[3, :3]) < assert_epsilon
     assert torch.abs(T[3, 3] - 1.0) < assert_epsilon
     R = T[:3, :3]
-    assert (
-        torch.abs(torch.abs(torch.det(R)) - 1.0) < assert_epsilon
-    ), "det(R) = %f" % torch.det(R)
+    assert torch.abs(torch.abs(torch.det(R)) - 1.0) < assert_epsilon, "det(R) = %f" % torch.det(R)
     p = T[:3, 3]
     Tinv = torch.eye(4, device=T.device, dtype=T.dtype)
     Rinv = R.T
@@ -148,9 +141,7 @@ def getInverseHomogeneousTransformMatrix(T, epsilon=1.0e-14):
 def logMapSO3(R, epsilon=1.0e-14):
     assert R.shape[0] == 3
     assert R.shape[1] == 3
-    assert (
-        torch.abs(torch.abs(torch.det(R)) - 1.0) < assert_epsilon
-    ), "det(R) = %f" % torch.det(R)
+    assert torch.abs(torch.abs(torch.det(R)) - 1.0) < assert_epsilon, "det(R) = %f" % torch.det(R)
     half_traceR_minus_one = (torch.trace(R) - 1.0) / 2.0
     if half_traceR_minus_one < -R.new_ones(1):
         print("Warning: half_traceR_minus_one = %f < -1.0" % half_traceR_minus_one)
@@ -173,10 +164,7 @@ def expMapso3(omegahat, epsilon=1.0e-14):
     exp_omegahat = (
         torch.eye(3, device=omegahat.device, dtype=omegahat.dtype)
         + ((torch.sin(norm_omega) / (norm_omega + epsilon)) * omegahat)
-        + (
-            ((1.0 - torch.cos(norm_omega)) / (norm_omega + epsilon) ** 2)
-            * torch.matmul(omegahat, omegahat)
-        )
+        + (((1.0 - torch.cos(norm_omega)) / (norm_omega + epsilon) ** 2) * torch.matmul(omegahat, omegahat))
     )
     return exp_omegahat
 
@@ -197,10 +185,7 @@ def logMapSE3(T, epsilon=1.0e-14):
         - (0.5 * omegahat)
         + (
             (
-                (
-                    (2.0 * torch.sin(norm_omega))
-                    - (norm_omega * (1.0 + torch.cos(norm_omega)))
-                )
+                ((2.0 * torch.sin(norm_omega)) - (norm_omega * (1.0 + torch.cos(norm_omega))))
                 / ((2 * (norm_omega**2) * torch.sin(norm_omega)) + epsilon)
             )
             * torch.matmul(omegahat, omegahat)
@@ -226,10 +211,7 @@ def expMapse3(kseehat, epsilon=1.0e-14):
     A = (
         torch.eye(3, device=kseehat.device, dtype=kseehat.dtype)
         + (((1.0 - torch.cos(norm_omega)) / (norm_omega + epsilon) ** 2) * omegahat)
-        + (
-            ((norm_omega - torch.sin(norm_omega)) / ((norm_omega + epsilon) ** 3))
-            * torch.matmul(omegahat, omegahat)
-        )
+        + (((norm_omega - torch.sin(norm_omega)) / ((norm_omega + epsilon) ** 3)) * torch.matmul(omegahat, omegahat))
     )
     v = kseehat[:3, 3]
     exp_kseehat = torch.eye(4, device=kseehat.device, dtype=kseehat.dtype)

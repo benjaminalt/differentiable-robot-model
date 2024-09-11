@@ -5,15 +5,11 @@ Utils
 TODO
 """
 
-import random
-from contextlib import contextmanager
-
-import numpy as np
-import timeit
-import torch
 import operator
 from functools import reduce
 
+import numpy as np
+import torch
 
 prod = lambda l: reduce(operator.mul, l, 1)
 
@@ -61,10 +57,7 @@ def exp_map_so3(omega, epsilon=1.0e-14):
     exp_omegahat = (
         torch.eye(3)
         + ((torch.sin(norm_omega) / (norm_omega + epsilon)) * omegahat)
-        + (
-            ((1.0 - torch.cos(norm_omega)) / (torch_square(norm_omega + epsilon)))
-            * (omegahat @ omegahat)
-        )
+        + (((1.0 - torch.cos(norm_omega)) / (torch_square(norm_omega + epsilon))) * (omegahat @ omegahat))
     )
     return exp_omegahat
 
@@ -84,3 +77,14 @@ def convert_into_at_least_2d_pytorch_tensor(variable):
         return tensor_var.unsqueeze(0)
     else:
         return tensor_var
+
+
+def sqrt_positive_part(x: torch.Tensor) -> torch.Tensor:
+    """
+    Returns torch.sqrt(torch.max(0, x))
+    but with a zero subgradient where x is 0.
+    """
+    ret = torch.zeros_like(x)
+    positive_mask = x > 0
+    ret[positive_mask] = torch.sqrt(x[positive_mask])
+    return ret

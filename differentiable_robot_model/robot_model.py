@@ -2,24 +2,24 @@
 """
 Differentiable robot model class
 ====================================
-TODO
 """
 
-from typing import List, Tuple, Dict, Optional
+import logging
 from dataclasses import dataclass
-import os
+from typing import Dict, List, Optional, Tuple
 
 import torch
+from pytorch_utils.pbar import spi_pbar
+from pytorch_utils.transformations import pose_to_affine, quaternion_to_euler_zyx
+from torch import autograd
 
-from .rigid_body import (
-    DifferentiableRigidBody,
-)
-from .spatial_vector_algebra import SpatialMotionVec, SpatialForceVec
+from differentiable_robot_model.lbfgs import LBFGS
+
+from .rigid_body import DifferentiableRigidBody
+from .spatial_vector_algebra import SpatialForceVec, SpatialMotionVec
 from .urdf_utils import URDFRobotModel
 
-import diff_robot_data
-
-robot_description_folder = diff_robot_data.__path__[0]
+logger = logging.getLogger(__name__)
 
 
 def tensor_check(function):
@@ -35,17 +35,13 @@ def tensor_check(function):
     def preprocess(arg, obj, batch_info):
         if type(arg) is torch.Tensor:
             # Check device
-            assert (
-                arg.device.type == obj._device.type
-            ), f"Input argument of different device as module: {arg}"
+            assert arg.device.type == obj._device.type, f"Input argument of different device as module: {arg}"
 
             # Check dimensions & convert to 2-dim tensors
             assert arg.ndim in [1, 2], f"Input tensors must have ndim of 1 or 2."
 
             if batch_info.init:
-                assert (
-                    batch_info.shape == arg.shape[:-1]
-                ), "Batch size mismatch between input tensors."
+                assert batch_info.shape == arg.shape[:-1], "Batch size mismatch between input tensors."
             else:
                 batch_info.init = True
                 batch_info.shape = arg.shape[:-1]
@@ -66,9 +62,7 @@ def tensor_check(function):
 
         # Parse input
         processed_args = [preprocess(arg, self, batch_info) for arg in args]
-        processed_kwargs = {
-            key: preprocess(kwargs[key], self, batch_info) for key in kwargs
-        }
+        processed_kwargs = {key: preprocess(kwargs[key], self, batch_info) for key in kwargs}
 
         # Perform function
         ret = function(self, *processed_args, **processed_kwargs)
@@ -96,27 +90,25 @@ class DifferentiableRobotModel(torch.nn.Module):
         super().__init__()
 
         self.name = name
+        self.__urdf_path = urdf_path
 
-        self._device = (
-            torch.device(device) if device is not None else torch.device("cpu")
-        )
+        self._device = torch.device(device) if device is not None else torch.device("cpu")
 
         self._urdf_model = URDFRobotModel(urdf_path=urdf_path, device=self._device)
         self._bodies = torch.nn.ModuleList()
         self._n_dofs = 0
         self._controlled_joints = []
+        self._controlled_joint_names = []
 
         # here we're making the joint a part of the rigid body
         # while urdfs model joints and rigid bodies separately
         # joint is at the beginning of a link
         self._name_to_idx_map = dict()
 
-        for (i, link) in enumerate(self._urdf_model.robot.links):
+        for i, link in enumerate(self._urdf_model.robot.links):
             # Initialize body object
             rigid_body_params = self._urdf_model.get_body_parameters_from_urdf(i, link)
-            body = DifferentiableRigidBody(
-                rigid_body_params=rigid_body_params, device=self._device
-            )
+            body = DifferentiableRigidBody(rigid_body_params=rigid_body_params, device=self._device)
 
             # Joint properties
             body.joint_idx = None
@@ -124,6 +116,7 @@ class DifferentiableRobotModel(torch.nn.Module):
                 body.joint_idx = self._n_dofs
                 self._n_dofs += 1
                 self._controlled_joints.append(i)
+                self._controlled_joint_names.append(rigid_body_params["joint_name"])
 
             # Add to data structures
             self._bodies.append(body)
@@ -133,7 +126,7 @@ class DifferentiableRobotModel(torch.nn.Module):
         for body in self._bodies[1:]:
             parent_body_name = self._urdf_model.get_name_of_parent_body(body.name)
             parent_body_idx = self._name_to_idx_map[parent_body_name]
-            body.set_parent(self._bodies[parent_body_idx])
+            # body.set_parent(self._bodies[parent_body_idx])
             self._bodies[parent_body_idx].add_child(body)
 
     @tensor_check
@@ -155,12 +148,15 @@ class DifferentiableRobotModel(torch.nn.Module):
 
         batch_size = q.shape[0]
 
-        # update the state of the joints
+        # update the state of the joints that are invariant to joint configuration changes to also respect the batch size
+        for i in range(self._controlled_joints[0]):
+            self._bodies[i].update_joint_state(
+                torch.zeros((batch_size, 1), device=self._device), torch.zeros((batch_size, 1), device=self._device)
+            )
+
         for i in range(q.shape[1]):
             idx = self._controlled_joints[i]
-            self._bodies[idx].update_joint_state(
-                q[:, i].unsqueeze(1), qd[:, i].unsqueeze(1)
-            )
+            self._bodies[idx].update_joint_state(q[:, i].unsqueeze(1), qd[:, i].unsqueeze(1))
 
         # we assume a non-moving base
         parent_body = self._bodies[0]
@@ -168,6 +164,10 @@ class DifferentiableRobotModel(torch.nn.Module):
             torch.zeros((batch_size, 3), device=self._device),
             torch.zeros((batch_size, 3), device=self._device),
         )
+
+        # make root body also respect batch size
+        self._bodies[0].pose.set_translation(torch.zeros((len(q), 3), device=q.device))
+        self._bodies[0].pose.set_rotation(torch.eye(3, device=q.device).repeat((len(q), 1, 1)))
 
         # propagate the new joint state through the kinematic chain to update bodies position/velocities
         for i in range(1, len(self._bodies)):
@@ -179,6 +179,7 @@ class DifferentiableRobotModel(torch.nn.Module):
 
             # transformation operator from child link to parent link
             childToParentT = body.joint_pose
+
             # transformation operator from parent link to child link
             parentToChildT = childToParentT.inverse()
 
@@ -195,9 +196,7 @@ class DifferentiableRobotModel(torch.nn.Module):
         return
 
     @tensor_check
-    def compute_forward_kinematics_all_links(
-        self, q: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_forward_kinematics_all_links(self, q: torch.Tensor, recursive: bool = False) -> Dict[str, torch.Tensor]:
         r"""
 
         Args:
@@ -207,18 +206,25 @@ class DifferentiableRobotModel(torch.nn.Module):
         Returns: translation and rotation of the link frame
 
         """
-        # Create joint state dictionary
-        q_dict = {}
-        for i, body_idx in enumerate(self._controlled_joints):
-            q_dict[self._bodies[body_idx].name] = q[:, i].unsqueeze(1)
+        if recursive:
+            # Create joint state dictionary
+            q_dict = {}
+            for i, body_idx in enumerate(self._controlled_joints):
+                q_dict[self._bodies[body_idx].name] = q[:, i].unsqueeze(1)
 
-        # Call forward kinematics on root node
-        pose_dict = self._bodies[0].forward_kinematics(q_dict)
+            # Call forward kinematics on root node
+            pose_dict = self._bodies[0].forward_kinematics(q_dict)
 
-        return {
-            link: (pose_dict[link].translation(), pose_dict[link].get_quaternion())
-            for link in pose_dict.keys()
-        }
+        else:
+            qd = torch.zeros_like(q)
+            self.update_kinematic_state(q, qd)
+
+            pose_dict = {}
+            for link_name in self.get_link_names():
+                pose_dict[link_name] = self._bodies[self._name_to_idx_map[link_name]].pose
+
+        result = {link: (pose_dict[link].translation(), pose_dict[link].get_quaternion()) for link in pose_dict.keys()}
+        return result
 
     @tensor_check
     def compute_forward_kinematics(
@@ -272,9 +278,7 @@ class DifferentiableRobotModel(torch.nn.Module):
             acc_parent_body = parent_body.acc.transform(inv_pose)
             # body velocity cross joint vel
             tmp = body.vel.cross_motion_vec(body.joint_vel)
-            body.acc = acc_parent_body.add_motion_vec(body.joint_acc).add_motion_vec(
-                tmp
-            )
+            body.acc = acc_parent_body.add_motion_vec(body.joint_acc).add_motion_vec(tmp)
 
         # reset all forces for backward pass
         for i in range(0, len(self._bodies)):
@@ -357,12 +361,8 @@ class DifferentiableRobotModel(torch.nn.Module):
             axis_idx = int(torch.where(axis)[0])
             rot_sign = torch.sign(axis[axis_idx])
 
-            rot_axis[:, axis_idx] = rot_sign * torch.ones(
-                batch_size, device=self._device
-            )
-            force[:, i] += (
-                self._bodies[idx].force.ang.unsqueeze(1) @ rot_axis.unsqueeze(2)
-            ).squeeze()
+            rot_axis[:, axis_idx] = rot_sign * torch.ones(batch_size, device=self._device)
+            force[:, i] += (self._bodies[idx].force.ang.unsqueeze(1) @ rot_axis.unsqueeze(2)).squeeze()
 
         # we add forces to counteract damping
         if use_damping:
@@ -373,6 +373,263 @@ class DifferentiableRobotModel(torch.nn.Module):
             force += damping_const.repeat(batch_size, 1) * qd
 
         return force
+
+    def compute_inverse_kinematics_jac(
+        self,
+        trans: torch.Tensor,
+        rot: torch.Tensor,
+        link_name: str,
+        init_conf: torch.Tensor,
+        max_num_iter: int = 1000,
+        min_precision: float = 0.1,
+        min_convergency_update: float = 1e-3,
+        learning_rate: float = 0.1,
+        damping_factor: float = 0.04,
+        verbose: bool = False,
+    ) -> torch.Tensor:
+        """
+        Compute differentiable IK via damped least squares.
+        Warning: The current implementation does not properly take end-effector orientations into account. Use
+        Use compute_inverse_kinematics_gd instead.
+
+        Args:
+            trans: translation vector [batch_size x 3]
+            rot: rotation vector [batch_size x (x, y, z, w)]
+            link_name: name of link
+            init_conf: initinal configuration [n_dofs] (optional)
+            max_num_iter: maximal number of iterations
+            min_precision: which precision is good enough
+            verbose: show debug log
+
+        Returns: final configuration
+        """
+        assert trans.ndim == 2, rot.ndim == 2
+        assert trans.shape[0] == rot.shape[0]
+        assert trans.shape[1] == 3 and rot.shape[1] == 4
+        assert init_conf is not None and len(init_conf) == self._n_dofs
+
+        batch_size = trans.shape[0]
+        final_conf = torch.empty((batch_size, self._n_dofs), device=trans.device)
+
+        # values used in https://ieeexplore.ieee.org/document/294335
+        eps = 0.04
+        lambda_max = 0.04
+
+        delta_confs = []
+
+        for th_idx in range(batch_size):
+            if th_idx == 0:
+                curr_conf = init_conf
+            else:
+                curr_conf = final_conf[th_idx - 1]
+
+            # TODO: tested quaternion_to_euler_xyz, but different results. Check why?
+            goal_pose = torch.cat((trans[th_idx], quaternion_to_euler_zyx(rot[th_idx, [3, 0, 1, 2]])))
+            min_error = torch.inf
+
+            # logging
+            if verbose:
+                positions = []
+                errors = []
+                bar = spi_pbar(max_num_iter)
+
+            import kinpy as kp
+
+            chain = kp.build_serial_chain_from_urdf(open(self.__urdf_path).read(), end_link_name=link_name)
+
+            i = 0
+            while True:
+
+                curr_pos, curr_rot = self.compute_forward_kinematics(curr_conf, link_name=link_name)
+                curr_pose = torch.cat((curr_pos, quaternion_to_euler_zyx(curr_rot[..., [3, 0, 1, 2]])))
+
+                import transformations as tf
+
+                t = chain.forward_kinematics(th=curr_conf)
+                curr_pose2 = torch.concat(
+                    (torch.as_tensor(t.pos), torch.as_tensor(tf.euler_from_quaternion(t.rot)))
+                ).to(torch.float32)
+                torch.allclose(curr_pose, curr_pose2)
+
+                curr_delta_pose = goal_pose - curr_pose
+                delta_norm = torch.norm(curr_delta_pose)
+
+                if verbose:
+                    positions.append(curr_pos.cpu().detach().numpy())
+                    errors.append(curr_delta_pose)
+                    bar.set_description(f"{th_idx} link loss in {i}: {delta_norm}")
+
+                if delta_norm < min_error:
+                    min_error = delta_norm
+                    final_conf[th_idx] = curr_conf
+
+                if delta_norm < min_precision:
+                    if verbose:
+                        logger.debug("min precision reached")
+                    break
+
+                if i >= max_num_iter:
+                    if verbose:
+                        logger.debug("maximum number of iterations reached")
+                    break
+
+                jac2 = torch.as_tensor(chain.jacobian(th=curr_conf), dtype=torch.float32)
+                lin_jac, ang_jac = self.compute_endeffector_jacobian(curr_conf, link_name=link_name)
+                jac = torch.concat((lin_jac, ang_jac), dim=0)
+                torch.allclose(jac, jac2)
+                print(curr_delta_pose.tolist())
+
+                #### pseudo inverse
+                # pjac = torch.linalg.pinv(jac) # pseudo inverse
+                # curr_delta_conf = pjac @ curr_delta_pose
+
+                #### damped least squares
+                # implemented from https://ieeexplore.ieee.org/document/294335
+                _, S, _ = torch.svd(jac)
+                smallest_s = torch.min(S)
+                if smallest_s >= eps:
+                    damping_factor = 0
+                else:
+                    damping_factor = (1 - (smallest_s / eps) ** 2) * lambda_max**2
+                damping_factor = 0.04**2
+
+                curr_delta_conf = torch.linalg.solve(
+                    jac.T @ jac + damping_factor * torch.eye(jac.shape[1], device=jac.device), jac.T @ curr_delta_pose
+                )
+                delta_confs.append(curr_delta_conf)
+
+                if torch.norm(curr_delta_conf) < min_convergency_update:
+                    if verbose:
+                        logger.debug("convergency update too small")
+                    break
+
+                curr_conf = curr_conf + learning_rate * curr_delta_conf
+
+                i += 1
+
+            if verbose:
+                logger.debug(f"{th_idx} final loss: {min_error}")
+
+                import numpy as np
+                from matplotlib import colors
+                from matplotlib import pyplot as plt
+
+                plt.figure()
+                plt.title("DLG IK: cartesian error over iteration steps")
+                plt.plot(torch.stack(errors).cpu().detach().numpy(), label=["x", "y", "z", "ax", "xy", "xz"])
+                plt.yscale("log")
+                plt.legend()
+                plt.show()
+
+                fig = plt.figure()
+                plt.title("Manipulator Pose in cartesian space over iteration steps")
+                cmap = colors.LinearSegmentedColormap.from_list("", ["green", "red"])
+                ax = fig.add_subplot(111, projection="3d")
+                # ax.plot(*np.array(positions).T, c='blue')
+                ax.scatter(*np.array(positions).T, c=[cmap(x / len(positions)) for x in range(len(positions))])
+                ax.scatter(*goal_pose[:3].cpu().detach(), c="black")
+                ax.scatter(*positions[0], c="green")
+                plt.show()
+
+        if min_error > min_precision:
+            logger.warn(f"differentiable ik accuracy above min precision {min_precision}: {min_error}")
+
+        return final_conf
+
+    # @tensor_check
+    def compute_inverse_kinematics_gd(
+        self,
+        trans: torch.Tensor,
+        rot: torch.Tensor,
+        link_name: str,
+        max_num_iter: int,
+        min_precision: float,
+        init_conf: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute differentiable IK using gradient descent.
+
+        Args:
+            trans: translation vector [batch_size x 3]
+            rot: rotation vector [batch_size x 4]
+            link_name: name of link
+            init_conf: initinal configuration for first batch_size variable [n_dofs] (optional)
+            max_num_iter: maximal number of iterations
+            min_precision: which precision is good enough
+
+        Returns: final configuration
+        """
+        assert trans.ndim == 2, rot.ndim == 2
+        assert trans.shape[0] == rot.shape[0]
+        assert trans.shape[1] == 3 and rot.shape[1] == 4
+
+        batch_size = trans.shape[0]
+        final_conf = torch.empty((batch_size, self._n_dofs), device=rot.device)
+
+        requires_grad = init_conf.requires_grad or trans.requires_grad or rot.requires_grad
+
+        if init_conf is None:
+            curr_conf = torch.zeros((batch_size, self._n_dofs))  # TODO: find better approximation?!
+        else:
+            if len(init_conf.shape) == 1:
+                curr_conf = init_conf[None].repeat(batch_size, 1)
+            else:
+                assert init_conf.shape[0] == batch_size
+                curr_conf = init_conf
+
+        goal_pose = torch.cat((trans, rot[:, [3, 0, 1, 2]]), dim=-1)
+        goal_pose_affine = pose_to_affine(goal_pose)
+
+        def compute_loss(curr_conf_g):
+            curr_pos, curr_rot = self.compute_forward_kinematics(curr_conf_g, link_name=link_name)
+            curr_rot = curr_rot[..., [3, 0, 1, 2]]
+            curr_pose = torch.cat((curr_pos, curr_rot), dim=-1)
+            curr_pose_affine = pose_to_affine(pose=curr_pose)
+
+            total_loss = torch.square(
+                torch.linalg.lstsq(goal_pose_affine, curr_pose_affine, rcond=-1)[0] - torch.eye(4, device=rot.device)
+            ).sum(dim=(-1, -2))
+
+            return total_loss
+
+        curr_conf_g = autograd.Variable(curr_conf, requires_grad=True)
+        optim = LBFGS(max_iter=max_num_iter)
+
+        def optim_closure(param: torch.Tensor):
+            # optim.zero_grad()
+            total_loss = compute_loss(param)
+            grads = autograd.grad(
+                inputs=param,
+                outputs=total_loss,
+                create_graph=True,
+                grad_outputs=torch.ones((batch_size,), device=param.device),
+                # is_grads_batched=True
+                # retain_graph=True,
+            )
+
+            grad = grads[0]
+
+            return total_loss, grad
+
+        with torch.set_grad_enabled(True):
+            curr_conf_g, total_loss = optim.step(curr_conf_g, optim_closure)
+
+        if not requires_grad:
+            # if input does not require any grad, dont retain grad info
+            curr_conf_g = curr_conf_g.detach()
+
+        if optim.state["n_iter"] >= 100 and requires_grad:
+            logging.warn(
+                "IK required strikingly many iterations to converge (%d). Gradients may explode!"
+                % optim.state["n_iter"]
+            )
+
+        final_conf = curr_conf_g
+
+        if torch.any(total_loss > min_precision):
+            logger.warn(f"differentiable ik accuracy above min precision {min_precision}: {total_loss}")
+
+        return final_conf
 
     @tensor_check
     def compute_non_linear_effects(
@@ -395,9 +652,7 @@ class DifferentiableRobotModel(torch.nn.Module):
 
         """
         zero_qdd = q.new_zeros(q.shape)
-        return self.compute_inverse_dynamics(
-            q, qd, zero_qdd, include_gravity, use_damping
-        )
+        return self.compute_inverse_dynamics(q, qd, zero_qdd, include_gravity, use_damping)
 
     @tensor_check
     def compute_lagrangian_inertia_matrix(
@@ -417,17 +672,11 @@ class DifferentiableRobotModel(torch.nn.Module):
         """
         assert q.shape[1] == self._n_dofs
         batch_size = q.shape[0]
-        identity_tensor = (
-            torch.eye(q.shape[1], device=self._device)
-            .unsqueeze(0)
-            .repeat(batch_size, 1, 1)
-        )
+        identity_tensor = torch.eye(q.shape[1], device=self._device).unsqueeze(0).repeat(batch_size, 1, 1)
         zero_qd = q.new_zeros(q.shape)
         zero_qdd = q.new_zeros(q.shape)
         if include_gravity:
-            gravity_term = self.compute_inverse_dynamics(
-                q, zero_qd, zero_qdd, include_gravity, use_damping
-            )
+            gravity_term = self.compute_inverse_dynamics(q, zero_qd, zero_qdd, include_gravity, use_damping)
         else:
             gravity_term = q.new_zeros(q.shape)
 
@@ -472,9 +721,7 @@ class DifferentiableRobotModel(torch.nn.Module):
 
         """
 
-        nle = self.compute_non_linear_effects(
-            q=q, qd=qd, include_gravity=include_gravity, use_damping=use_damping
-        )
+        nle = self.compute_non_linear_effects(q=q, qd=qd, include_gravity=include_gravity, use_damping=use_damping)
         inertia_mat = self.compute_lagrangian_inertia_matrix(
             q=q, include_gravity=include_gravity, use_damping=use_damping
         )
@@ -566,21 +813,15 @@ class DifferentiableRobotModel(torch.nn.Module):
             if parent_idx > 0:
                 parent_body = self._bodies[parent_idx]
                 U = body.U.get_vector()
-                Ud = U / (
-                    body.d.view(batch_size, 1) + 1e-37
-                )  # add smoothing values in case of zero mass
+                Ud = U / (body.d.view(batch_size, 1) + 1e-37)  # add smoothing values in case of zero mass
                 c = body.c.get_vector()
 
                 # IA is of size [batch_size x 6 x 6]
-                IA = body.IA - torch.bmm(
-                    U.view(batch_size, 6, 1), Ud.view(batch_size, 1, 6)
-                )
+                IA = body.IA - torch.bmm(U.view(batch_size, 6, 1), Ud.view(batch_size, 1, 6))
 
                 tmp = torch.bmm(IA, c.view(batch_size, 6, 1)).squeeze(dim=2)
                 tmps = SpatialForceVec(lin_force=tmp[:, 3:], ang_force=tmp[:, :3])
-                ud = body.u / (
-                    body.d + 1e-37
-                )  # add smoothing values in case of zero mass
+                ud = body.u / (body.d + 1e-37)  # add smoothing values in case of zero mass
                 uu = body.U.multiply(ud)
                 pa = body.pA.add_force_vec(tmps).add_force_vec(uu)
 
@@ -590,9 +831,7 @@ class DifferentiableRobotModel(torch.nn.Module):
                 transform_mat = joint_pose.to_matrix()
                 if transform_mat.shape[0] != IA.shape[0]:
                     transform_mat = transform_mat.repeat(IA.shape[0], 1, 1)
-                parent_body.IA += torch.bmm(transform_mat.transpose(-2, -1), IA).bmm(
-                    transform_mat
-                )
+                parent_body.IA += torch.bmm(transform_mat.transpose(-2, -1), IA).bmm(transform_mat)
                 parent_body.pA = parent_body.pA.add_force_vec(pa.transform(joint_pose))
 
         base_acc = SpatialMotionVec(lin_motion=base_lin_acc, ang_motion=base_ang_acc)
@@ -624,9 +863,7 @@ class DifferentiableRobotModel(torch.nn.Module):
         return qdd
 
     @tensor_check
-    def compute_endeffector_jacobian(
-        self, q: torch.Tensor, link_name: str
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_endeffector_jacobian(self, q: torch.Tensor, link_name: str) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""
 
         Args:
@@ -666,22 +903,52 @@ class DifferentiableRobotModel(torch.nn.Module):
 
         return lin_jac, ang_jac
 
-    def _get_parent_object_of_param(self, link_name: str, parameter_name: str):
-        body_idx = self._name_to_idx_map[link_name]
-        if parameter_name in ["trans", "rot_angles", "joint_damping"]:
-            parent_object = self._bodies[body_idx]
-        elif parameter_name in ["mass", "inertia_mat", "com"]:
-            parent_object = self._bodies[body_idx].inertia
-        else:
-            raise AttributeError(
-                "Invalid parameter name. Accepted parameter names are: "
-                "trans, rot_angles, joint_damping, mass, inertia_mat, com"
-            )
-        return parent_object
+    @tensor_check
+    def compute_endeffector_jacobian_all_links(self, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""
 
-    def make_link_param_learnable(
-        self, link_name: str, parameter_name: str, parametrization: torch.nn.Module
-    ):
+        Args:
+            q: joint angles [batch_size x n_dofs]
+
+        Returns: linear and angular jacobian of all links
+
+        """
+        # TODO: validate this method
+        assert len(q.shape) == 2
+        link_names = self.get_link_names()
+        link_name = link_names[-1]
+        num_links = len(link_names)
+
+        batch_size = q.shape[0]
+        self.compute_forward_kinematics(q, link_name)
+
+        p_es = [self._bodies[self._name_to_idx_map[l]].pose.translation() for l in link_names[1:]]
+        p_es = torch.stack(p_es, dim=1)
+
+        lin_jac, ang_jac = (
+            torch.zeros([batch_size, num_links, 3, self._n_dofs], device=self._device),
+            torch.zeros([batch_size, num_links, 3, self._n_dofs], device=self._device),
+        )
+
+        joint_id = self._bodies[self._name_to_idx_map[link_name]].joint_id
+        while link_name != self._bodies[0].name:
+            if joint_id in self._controlled_joints:
+                i = self._controlled_joints.index(joint_id)
+                idx = joint_id
+
+                pose = self._bodies[idx].pose
+                axis = self._bodies[idx].joint_axis
+                p_i = pose.translation()
+                z_i = pose.rotation() @ axis.squeeze()
+                lin_jac[:, idx + 1 :, :, i] = torch.cross(z_i[:, None], p_es[:, idx:] - p_i[:, None], dim=-1)
+                ang_jac[:, idx:, :, i] = z_i[:, None]
+
+            link_name = self._urdf_model.get_name_of_parent_body(link_name)
+            joint_id = self._bodies[self._name_to_idx_map[link_name]].joint_id
+
+        return lin_jac, ang_jac
+
+    def make_link_param_learnable(self, link_name: str, parameter_name: str, parametrization: torch.nn.Module):
         parent_object = self._get_parent_object_of_param(link_name, parameter_name)
 
         # Replace current parameter with a learnable module
@@ -742,7 +1009,7 @@ class DifferentiableRobotModel(torch.nn.Module):
 
         """
         for i in range(len(self._bodies)):
-            print(self._bodies[i].name)
+            logger.debug(self._bodies[i].name)
 
     def print_learnable_params(self) -> None:
         r"""
@@ -751,40 +1018,4 @@ class DifferentiableRobotModel(torch.nn.Module):
 
         """
         for name, param in self.named_parameters():
-            print(f"{name}: {param}")
-
-
-class DifferentiableKUKAiiwa(DifferentiableRobotModel):
-    def __init__(self, device=None):
-        rel_urdf_path = "kuka_iiwa/urdf/iiwa7.urdf"
-        self.urdf_path = os.path.join(robot_description_folder, rel_urdf_path)
-        self.learnable_rigid_body_config = None
-        self.name = "differentiable_kuka_iiwa"
-        super().__init__(self.urdf_path, self.name, device=device)
-
-
-class DifferentiableFrankaPanda(DifferentiableRobotModel):
-    def __init__(self, device=None):
-        rel_urdf_path = "panda_description/urdf/panda_no_gripper.urdf"
-        self.urdf_path = os.path.join(robot_description_folder, rel_urdf_path)
-        self.learnable_rigid_body_config = None
-        self.name = "differentiable_franka_panda"
-        super().__init__(self.urdf_path, self.name, device=device)
-
-
-class DifferentiableTwoLinkRobot(DifferentiableRobotModel):
-    def __init__(self, device=None):
-        rel_urdf_path = "2link_robot.urdf"
-        self.urdf_path = os.path.join(robot_description_folder, rel_urdf_path)
-        self.learnable_rigid_body_config = None
-        self.name = "diff_2d_robot"
-        super().__init__(self.urdf_path, self.name, device=device)
-
-
-class DifferentiableTrifingerEdu(DifferentiableRobotModel):
-    def __init__(self, device=None):
-        rel_urdf_path = "trifinger_edu_description/trifinger_edu.urdf"
-        self.urdf_path = os.path.join(robot_description_folder, rel_urdf_path)
-        self.learnable_rigid_body_config = None
-        self.name = "trifinger_edu"
-        super().__init__(self.urdf_path, self.name, device=device)
+            logger.debug(f"{name}: {param}")
